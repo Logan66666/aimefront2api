@@ -11,6 +11,7 @@
 
 const express = require("express");
 const { v4: uuidv4 } = require("uuid");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
@@ -398,10 +399,58 @@ app.use((req, res, next) => {
 // API Key 鉴权（如果配置了）
 app.use((req, res, next) => {
   if (!CONFIG.apiKey) return next();
-  if (req.path === "/dashboard") return next();
+  // Dashboard 使用独立的 cookie 认证，不拦
+  if (req.path === "/dashboard" || req.path === "/dashboard/login" || req.path === "/dashboard/logout") return next();
   const auth = req.headers.authorization || "";
   if (auth === `Bearer ${CONFIG.apiKey}` || auth === CONFIG.apiKey) return next();
   res.status(401).json({ error: { message: "Invalid API key", type: "authentication_error" } });
+});
+
+// ============================================================
+// Dashboard 服务端认证（HttpOnly cookie，不依赖前端 JS）
+// ============================================================
+const dashboardSessions = new Map(); // token → { expires: timestamp }
+const DASHBOARD_SESSION_TTL = 3600000; // 1 小时
+const COOKIE_NAME = "dash_token";
+
+function generateDashboardToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+function hasDashboardAuth(req) {
+  if (!CONFIG.apiKey) return true; // 没配 API key 则开放
+  const token = req.cookies?.[COOKIE_NAME];
+  if (!token) return false;
+  const session = dashboardSessions.get(token);
+  if (!session) return false;
+  if (Date.now() > session.expires) {
+    dashboardSessions.delete(token);
+    return false;
+  }
+  return true;
+}
+
+function setDashboardCookie(res, token) {
+  res.cookie(COOKIE_NAME, token, {
+    httpOnly: true,
+    secure: false, // 本地开发 HTTP，生产通过反代加 HTTPS 时改为 true
+    sameSite: "lax",
+    maxAge: DASHBOARD_SESSION_TTL,
+    path: "/",
+  });
+}
+
+// 简单 cookie 解析（不需要额外依赖）
+app.use((req, res, next) => {
+  if (!req.cookies) {
+    req.cookies = {};
+    const raw = req.headers.cookie || "";
+    raw.split(";").forEach(c => {
+      const idx = c.indexOf("=");
+      if (idx > 0) req.cookies[c.slice(0, idx).trim()] = c.slice(idx + 1).trim();
+    });
+  }
+  next();
 });
 
 // ============================================================
@@ -592,182 +641,88 @@ app.post("/admin/cleanup", async (req, res) => {
 });
 
 // ============================================================
-// 仪表盘
 // ============================================================
+// Dashboard — 服务端认证，未登录用户拿不到数据
+// ============================================================
+
+// 登录页
+app.get("/dashboard/login", (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AIME Proxy · 登录</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{display:flex;align-items:center;justify-content:center;min-height:100vh;background:#fafaf9;font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif}
+  .card{background:#fff;border:1px solid #e7e5e4;border-radius:8px;padding:36px 40px;width:380px;box-shadow:0 2px 8px rgba(0,0,0,0.05)}
+  h2{font-size:18px;font-weight:700;color:#1e3a8a;margin-bottom:6px}
+  .sub{font-size:13px;color:#78716c;margin-bottom:20px}
+  input{width:100%;padding:10px 14px;border:1px solid #d6d3d1;border-radius:5px;font-size:14px;font-family:monospace;outline:none;margin-bottom:14px}
+  input:focus{border-color:#1e3a8a}
+  button{width:100%;padding:10px;background:#1e3a8a;color:#fff;border:none;border-radius:5px;font-size:14px;font-weight:600;cursor:pointer}
+  button:hover{background:#1e40af}
+  .err{color:#991b1b;font-size:12px;margin-top:10px;text-align:center}
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>AIME Proxy Dashboard</h2>
+  <p class="sub">请输入 API Key 登录监控面板</p>
+  <form method="POST" action="/dashboard/login">
+    <input name="key" type="password" placeholder="sk-xxx" autocomplete="off" autofocus>
+    <button type="submit">登录</button>
+  </form>
+  ${req.query.err ? '<p class="err">Key 无效，请重试</p>' : ''}
+</div>
+</body></html>`);
+});
+
+// 处理登录
+app.post("/dashboard/login", express.urlencoded({ extended: true }), (req, res) => {
+  const key = (req.body.key || "").trim();
+  if (!key || key !== CONFIG.apiKey) {
+    return res.redirect("/dashboard/login?err=1");
+  }
+  const token = generateDashboardToken();
+  dashboardSessions.set(token, { expires: Date.now() + DASHBOARD_SESSION_TTL });
+  setDashboardCookie(res, token);
+  res.redirect("/dashboard");
+});
+
+// 退出
+app.post("/dashboard/logout", (req, res) => {
+  const token = req.cookies?.[COOKIE_NAME];
+  if (token) dashboardSessions.delete(token);
+  res.clearCookie(COOKIE_NAME, { path: "/" });
+  res.redirect("/dashboard/login");
+});
+
+// 仪表盘主页（需认证）
 app.get("/dashboard", (req, res) => {
+  if (!hasDashboardAuth(req)) {
+    return res.redirect("/dashboard/login");
+  }
   const uptime = Math.floor((Date.now() - serverStartTime) / 1000);
   const avgTime = stats.responseTimes.length > 0
     ? Math.round(stats.responseTimes.reduce((a, b) => a + b, 0) / stats.responseTimes.length)
     : 0;
   const succRate = stats.totalRequests > 0 ? Math.round(stats.successRequests / stats.totalRequests * 100) : 100;
-
-  // 模型表（按请求数排序）
-  const modelRows = Object.entries(stats.modelUsage)
-    .sort((a, b) => b[1].requests - a[1].requests);
-
-  // 时间线数据 → CSS bar chart
+  const modelRows = Object.entries(stats.modelUsage).sort((a, b) => b[1].requests - a[1].requests);
   const timelineEntries = Object.entries(stats.timeline).sort();
   const timelineMax = Math.max(1, ...timelineEntries.map(e => e[1]));
   const timelineBars = timelineEntries.slice(-60).map(([time, count]) => {
     const pct = Math.round(count / timelineMax * 100);
-    return `<div class="tl-bar" title="${time}: ${count} 请求"><div class="tl-fill" style="height:${pct}%"></div><span>${time.slice(11)}</span></div>`;
+    return '<div class="tl-bar" title="' + time + ': ' + count + ' 请求"><div class="tl-fill" style="height:' + pct + '%"></div><span>' + time.slice(11) + '</span></div>';
   }).join('');
 
-  res.send(`<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AIME Proxy · Dashboard</title>
-<style>
-  :root{--bg:#fafaf9;--card:#fff;--border:#e7e5e4;--text:#292524;--muted:#78716c;--navy:#1e3a8a;--green:#166534;--red:#991b1b;--amber:#b45309;--gr-bg:#dcfce7;--rd-bg:#fee2e2;--nb:#dbeafe}
-  *{margin:0;padding:0;box-sizing:border-box}
-  body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);line-height:1.6;padding:28px 36px;max-width:1100px;margin:0 auto}
-  .header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:24px;flex-wrap:wrap;gap:12px}
-  h1{font-size:22px;font-weight:700;color:var(--navy)}
-  .meta{font-size:12px;color:var(--muted);display:flex;gap:16px;flex-wrap:wrap}
-  .meta span{padding:3px 10px;background:var(--nb);border-radius:3px;font-weight:600;color:var(--navy)}
+  const modelTableRows = modelRows.map(([m, d]) =>
+    '<tr><td class="mono">' + m + '</td><td class="num">' + d.requests + '</td><td class="num">' + formatTokens(d.tokensIn) + '</td><td class="num">' + formatTokens(d.tokensOut) + '</td><td class="num" style="color:' + (d.errors > 0 ? 'var(--red)' : 'var(--muted)') + '">' + d.errors + '</td><td><div style="display:flex;align-items:center;gap:6px"><div class="bar-wrap" style="width:80px"><div class="bar-fill" style="width:' + (d.requests / stats.totalRequests * 100).toFixed(0) + '%"></div></div>' + (d.requests / stats.totalRequests * 100).toFixed(0) + '%</div></td></tr>'
+  ).join('');
 
-  .kpi-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:12px;margin-bottom:24px}
-  .kpi{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:16px}
-  .kpi .v{font-size:24px;font-weight:800;color:var(--navy)}
-  .kpi .l{font-size:11px;color:var(--muted);margin-top:2px}
-  .kpi.ok .v{color:var(--green)}
-  .kpi.err .v{color:var(--red)}
-  .kpi.warn .v{color:var(--amber)}
-
-  .row{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:24px}
-  @media(max-width:768px){.row{grid-template-columns:1fr}}
-
-  .panel{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:20px}
-  .panel h3{font-size:14px;font-weight:700;margin-bottom:12px;color:var(--text);border-bottom:1px solid var(--border);padding-bottom:8px}
-
-  table{width:100%;border-collapse:collapse;font-size:12px}
-  th,td{padding:7px 10px;text-align:left;border-bottom:1px solid var(--border);white-space:nowrap}
-  th{font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700;background:#fafaf9}
-  td.mono{font-family:"SF Mono","Fira Code",monospace;font-size:12px}
-  td.num{text-align:right;font-variant-numeric:tabular-nums}
-  tr:hover td{background:var(--nb)}
-
-  .bar-wrap{background:#f5f5f4;border-radius:3px;height:6px;overflow:hidden}
-  .bar-fill{background:var(--navy);height:100%;border-radius:3px;transition:width .3s}
-
-  .tl-chart{display:flex;align-items:flex-end;gap:2px;height:100px;padding:4px 0;overflow-x:auto}
-  .tl-bar{flex:0 0 auto;width:14px;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%}
-  .tl-fill{width:100%;background:var(--navy);border-radius:2px 2px 0 0;min-height:2px;transition:height .3s}
-  .tl-bar span{font-size:8px;color:var(--muted);margin-top:2px;transform:rotate(-45deg);white-space:nowrap}
-
-  .footer{text-align:center;font-size:11px;color:var(--muted);margin-top:16px;padding-top:12px;border-top:1px solid var(--border)}
-  .row-full{margin-bottom:24px}
-</style>
-</head>
-<body>
-<div id="auth-overlay" style="display:flex;position:fixed;inset:0;background:rgba(15,23,42,0.95);z-index:9999;align-items:center;justify-content:center;font-family:-apple-system,'PingFang SC',sans-serif">
-  <div style="background:#fff;border-radius:8px;padding:32px 36px;width:360px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,0.3)">
-    <div style="font-size:20px;font-weight:700;color:#1e3a8a;margin-bottom:4px">AIME Proxy</div>
-    <div style="font-size:13px;color:#78716c;margin-bottom:20px">请输入 API Key 查看监控面板</div>
-    <input id="auth-key" type="password" placeholder="sk-xxx" autocomplete="off"
-      style="width:100%;padding:10px 14px;border:1px solid #d6d3d1;border-radius:5px;font-size:14px;outline:none;margin-bottom:12px;font-family:monospace"
-      onkeydown="if(event.key==='Enter')doLogin()">
-    <button onclick="doLogin()" style="width:100%;padding:10px;background:#1e3a8a;color:#fff;border:none;border-radius:5px;font-size:14px;font-weight:600;cursor:pointer">验证并进入</button>
-    <div id="auth-err" style="color:#991b1b;font-size:12px;margin-top:10px;display:none"></div>
-    <div style="font-size:11px;color:#a8a29e;margin-top:16px">Key 将保存在浏览器本地存储中</div>
-  </div>
-</div>
-<div class="header">
-  <div>
-    <h1>AIME Proxy · 运行监控</h1>
-  </div>
-  <div class="meta">
-    <span>运行 ${formatUptime(uptime)}</span>
-    <span id="timer">0s 前刷新</span>
-  </div>
-</div>
-
-<div class="kpi-grid">
-  <div class="kpi"><div class="v">${stats.totalRequests}</div><div class="l">总请求数</div></div>
-  <div class="kpi ok"><div class="v">${succRate}%</div><div class="l">成功率 (${stats.successRequests}/${stats.totalRequests})</div></div>
-  <div class="kpi err"><div class="v">${stats.errorRequests}</div><div class="l">失败请求</div></div>
-  <div class="kpi"><div class="v">${stats.streamRequests}</div><div class="l">流式请求</div></div>
-  <div class="kpi"><div class="v">${avgTime}ms</div><div class="l">平均响应</div></div>
-  <div class="kpi warn"><div class="v">${formatTokens(stats.totalTokens.input + stats.totalTokens.output)}</div><div class="l">Token 消耗</div></div>
-</div>
-
-<div class="row">
-  <div class="panel">
-    <h3>请求时间线 (最近 60 分钟)</h3>
-    ${timelineEntries.length > 0 ? `<div class="tl-chart">${timelineBars}</div>` : '<p style="font-size:12px;color:var(--muted);padding:20px">暂无请求数据</p>'}
-  </div>
-  <div class="panel">
-    <h3>可用模型</h3>
-    <table>
-      <tr><th>模型 ID</th><th style="text-align:right">请求</th><th style="text-align:right">Token 入</th><th style="text-align:right">Token 出</th><th style="text-align:right">错误</th><th>占比</th></tr>
-      ${modelRows.map(([m,d]) => `<tr>
-        <td class="mono">${m}</td>
-        <td class="num">${d.requests}</td>
-        <td class="num">${formatTokens(d.tokensIn)}</td>
-        <td class="num">${formatTokens(d.tokensOut)}</td>
-        <td class="num" style="color:${d.errors>0?'var(--red)':'var(--muted)'}">${d.errors}</td>
-        <td><div style="display:flex;align-items:center;gap:6px"><div class="bar-wrap" style="width:80px"><div class="bar-fill" style="width:${(d.requests/stats.totalRequests*100).toFixed(0)}%"></div></div>${(d.requests/stats.totalRequests*100).toFixed(0)}%</div></td>
-      </tr>`).join('')}
-      ${modelRows.length===0 ? '<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:16px">暂无请求数据</td></tr>' : ''}
-    </table>
-  </div>
-</div>
-
-<div class="row">
-  <div class="panel">
-    <h3>Token 消耗</h3>
-    <table>
-      <tr><td style="color:var(--muted)">输入 Token</td><td class="num mono">${formatTokens(stats.totalTokens.input)}</td></tr>
-      <tr><td style="color:var(--muted)">输出 Token</td><td class="num mono">${formatTokens(stats.totalTokens.output)}</td></tr>
-      <tr><td style="color:var(--muted)">合计</td><td class="num mono" style="font-weight:700">${formatTokens(stats.totalTokens.input + stats.totalTokens.output)}</td></tr>
-      <tr><td style="color:var(--muted)">输入/输出比</td><td class="num mono">${stats.totalTokens.output>0?(stats.totalTokens.input/stats.totalTokens.output).toFixed(1)+':1':'—'}</td></tr>
-    </table>
-  </div>
-  <div class="panel">
-    <h3>配置</h3>
-    <table>
-      <tr><td style="color:var(--muted)">AIME 后端</td><td class="mono" style="font-size:11px">${CONFIG.aimeBaseUrl}</td></tr>
-      <tr><td style="color:var(--muted)">API Key</td><td>${CONFIG.apiKey ? '已启用' : '未启用'}</td></tr>
-      <tr><td style="color:var(--muted)">模型</td><td class="mono">${CONFIG.defaultModel}</td></tr>
-      <tr><td style="color:var(--muted)">重试 / 超时</td><td>${CONFIG.maxRetries} 次 / ${Math.round(CONFIG.requestTimeoutMs/1000)}s</td></tr>
-      <tr><td style="color:var(--muted)">孤儿清理</td><td>${cleanupStats.totalCleaned} 个 (每 ${CONFIG.cleanupIntervalMs/1000}s)</td></tr>
-      <tr><td style="color:var(--muted)">端口</td><td>${CONFIG.port}</td></tr>
-    </table>
-  </div>
-</div>
-
-<div class="footer">AIME Proxy v1.1 · 每 10s 自动刷新 · <a href="/health" style="color:var(--navy)">/health</a></div>
-<script>
-// 登录验证
-function doLogin(){
-  const k=document.getElementById('auth-key').value.trim();
-  if(!k) return;
-  fetch('/health',{headers:{authorization:'Bearer '+k}}).then(r=>{
-    if(r.ok){
-      sessionStorage.setItem('apikey',k);
-      document.getElementById('auth-overlay').style.display='none';
-    }else{
-      document.getElementById('auth-err').textContent='Key 无效，请重试';
-      document.getElementById('auth-err').style.display='block';
-    }
-  }).catch(()=>{
-    document.getElementById('auth-err').textContent='连接失败，请检查服务是否运行';
-    document.getElementById('auth-err').style.display='block';
-  });
-}
-(function(){
-  const saved=sessionStorage.getItem('apikey');
-  if(saved){fetch('/health',{headers:{authorization:'Bearer '+saved}}).then(r=>{
-    if(r.ok){document.getElementById('auth-overlay').style.display='none'}
-    else{sessionStorage.removeItem('apikey')}
-  }).catch(()=>{})}
-})();
-let t=new Date();setInterval(()=>{document.getElementById('timer').textContent=Math.floor((new Date()-t)/1000)+'s 前刷新'},1000);
-setTimeout(()=>location.reload(),10000);
-</script>
-</body></html>`);
+  res.send('<!DOCTYPE html>\n<html lang="zh-CN">\n<head>\n<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">\n<title>AIME Proxy · Dashboard</title>\n<style>\n:root{--bg:#fafaf9;--card:#fff;--border:#e7e5e4;--text:#292524;--muted:#78716c;--navy:#1e3a8a;--green:#166534;--red:#991b1b;--amber:#b45309;--nb:#dbeafe}\n*{margin:0;padding:0;box-sizing:border-box}\nbody{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);line-height:1.6;padding:28px 36px;max-width:1100px;margin:0 auto}\n.header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:24px;flex-wrap:wrap;gap:12px}\nh1{font-size:22px;font-weight:700;color:var(--navy)}\n.meta{font-size:12px;color:var(--muted);display:flex;gap:16px;flex-wrap:wrap;align-items:center}\n.meta span{padding:3px 10px;background:var(--nb);border-radius:3px;font-weight:600;color:var(--navy)}\n.logout-btn{font-size:11px;color:var(--muted);background:none;border:1px solid var(--border);padding:3px 12px;border-radius:4px;cursor:pointer}\n.logout-btn:hover{color:var(--red);border-color:var(--red)}\n.kpi-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:12px;margin-bottom:24px}\n.kpi{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:16px}\n.kpi .v{font-size:24px;font-weight:800;color:var(--navy)}\n.kpi .l{font-size:11px;color:var(--muted);margin-top:2px}\n.kpi.ok .v{color:var(--green)}\n.kpi.err .v{color:var(--red)}\n.kpi.warn .v{color:var(--amber)}\n.row{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:24px}\n@media(max-width:768px){.row{grid-template-columns:1fr}}\n.panel{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:20px}\n.panel h3{font-size:14px;font-weight:700;margin-bottom:12px;color:var(--text);border-bottom:1px solid var(--border);padding-bottom:8px}\ntable{width:100%;border-collapse:collapse;font-size:12px}\nth,td{padding:7px 10px;text-align:left;border-bottom:1px solid var(--border);white-space:nowrap}\nth{font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700;background:#fafaf9}\ntd.mono{font-family:"SF Mono","Fira Code",monospace;font-size:12px}\ntd.num{text-align:right;font-variant-numeric:tabular-nums}\ntr:hover td{background:var(--nb)}\n.bar-wrap{background:#f5f5f4;border-radius:3px;height:6px;overflow:hidden}\n.bar-fill{background:var(--navy);height:100%;border-radius:3px;transition:width .3s}\n.tl-chart{display:flex;align-items:flex-end;gap:2px;height:100px;padding:4px 0;overflow-x:auto}\n.tl-bar{flex:0 0 auto;width:14px;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%}\n.tl-fill{width:100%;background:var(--navy);border-radius:2px 2px 0 0;min-height:2px;transition:height .3s}\n.tl-bar span{font-size:8px;color:var(--muted);margin-top:2px;transform:rotate(-45deg);white-space:nowrap}\n.footer{text-align:center;font-size:11px;color:var(--muted);margin-top:16px;padding-top:12px;border-top:1px solid var(--border)}\n</style>\n</head>\n<body>\n<div class="header">\n  <div><h1>AIME Proxy · 运行监控</h1></div>\n  <div class="meta">\n    <span>运行 ' + formatUptime(uptime) + '</span>\n    <span id="timer">0s 前刷新</span>\n    <form method="POST" action="/dashboard/logout" style="display:inline"><button class="logout-btn">退出</button></form>\n  </div>\n</div>\n\n<div class="kpi-grid">\n  <div class="kpi"><div class="v">' + stats.totalRequests + '</div><div class="l">总请求数</div></div>\n  <div class="kpi ok"><div class="v">' + succRate + '%</div><div class="l">成功率 (' + stats.successRequests + '/' + stats.totalRequests + ')</div></div>\n  <div class="kpi err"><div class="v">' + stats.errorRequests + '</div><div class="l">失败请求</div></div>\n  <div class="kpi"><div class="v">' + stats.streamRequests + '</div><div class="l">流式请求</div></div>\n  <div class="kpi"><div class="v">' + avgTime + 'ms</div><div class="l">平均响应</div></div>\n  <div class="kpi warn"><div class="v">' + formatTokens(stats.totalTokens.input + stats.totalTokens.output) + '</div><div class="l">Token 消耗</div></div>\n</div>\n\n<div class="row">\n  <div class="panel">\n    <h3>请求时间线 (最近 60 分钟)</h3>\n    ' + (timelineEntries.length > 0 ? '<div class="tl-chart">' + timelineBars + '</div>' : '<p style="font-size:12px;color:var(--muted);padding:20px">暂无请求数据</p>') + '\n  </div>\n  <div class="panel">\n    <h3>可用模型</h3>\n    <table><tr><th>模型 ID</th><th style="text-align:right">请求</th><th style="text-align:right">Token 入</th><th style="text-align:right">Token 出</th><th style="text-align:right">错误</th><th>占比</th></tr>\n    ' + (modelRows.length > 0 ? modelTableRows : '<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:16px">暂无请求数据</td></tr>') + '\n    </table>\n  </div>\n</div>\n\n<div class="row">\n  <div class="panel">\n    <h3>Token 消耗</h3>\n    <table>\n      <tr><td style="color:var(--muted)">输入 Token</td><td class="num mono">' + formatTokens(stats.totalTokens.input) + '</td></tr>\n      <tr><td style="color:var(--muted)">输出 Token</td><td class="num mono">' + formatTokens(stats.totalTokens.output) + '</td></tr>\n      <tr><td style="color:var(--muted)">合计</td><td class="num mono" style="font-weight:700">' + formatTokens(stats.totalTokens.input + stats.totalTokens.output) + '</td></tr>\n      <tr><td style="color:var(--muted)">输入/输出比</td><td class="num mono">' + (stats.totalTokens.output > 0 ? (stats.totalTokens.input / stats.totalTokens.output).toFixed(1) + ':1' : '—') + '</td></tr>\n    </table>\n  </div>\n  <div class="panel">\n    <h3>配置</h3>\n    <table>\n      <tr><td style="color:var(--muted)">AIME 后端</td><td class="mono" style="font-size:11px">' + CONFIG.aimeBaseUrl + '</td></tr>\n      <tr><td style="color:var(--muted)">API Key</td><td>' + (CONFIG.apiKey ? '已启用' : '未启用') + '</td></tr>\n      <tr><td style="color:var(--muted)">模型</td><td class="mono">' + CONFIG.defaultModel + '</td></tr>\n      <tr><td style="color:var(--muted)">重试 / 超时</td><td>' + CONFIG.maxRetries + ' 次 / ' + Math.round(CONFIG.requestTimeoutMs / 1000) + 's</td></tr>\n      <tr><td style="color:var(--muted)">孤儿清理</td><td>' + cleanupStats.totalCleaned + ' 个 (每 ' + CONFIG.cleanupIntervalMs / 1000 + 's)</td></tr>\n      <tr><td style="color:var(--muted)">端口</td><td>' + CONFIG.port + '</td></tr>\n    </table>\n  </div>\n</div>\n\n<div class="footer">AIME Proxy v1.1 · 每 10s 自动刷新 · <a href="/health" style="color:var(--navy)">/health</a></div>\n<script>\nlet t=new Date();setInterval(()=>{document.getElementById(\'timer\').textContent=Math.floor((new Date()-t)/1000)+\'s 前刷新\'},1000);\nsetTimeout(()=>location.reload(),10000);\n</script>\n</body></html>');
 });
+
 
 function formatUptime(s) {
   const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;
