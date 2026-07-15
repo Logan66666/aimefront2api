@@ -2,7 +2,7 @@
   "aimeBaseUrl": "https://data.10jqka.com.cn/aime-front",
   "aimeDirectory": "/app/backend",
   "port": 3000,
-  "apiKey": "",
+  "apiKey": "sk-your-random-key-here",
   "defaultModel": "deepseek-v4-pro",
   "cleanupIntervalMs": 600000,
   "cleanupMaxAgeMs": 3600000,
