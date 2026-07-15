@@ -1,0 +1,15 @@
+{
+  "name": "aime-openai-proxy",
+  "version": "1.0.0",
+  "description": "同花顺 AIME (AI 金融投顾) → OpenAI Chat Completions API 兼容代理",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["aime", "opencode", "openai", "proxy", "web2api", "10jqka"],
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.21.0",
+    "uuid": "^11.0.0"
+  }
+}

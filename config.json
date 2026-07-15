@@ -1,0 +1,14 @@
+{
+  "aimeBaseUrl": "https://data.10jqka.com.cn/aime-front",
+  "aimeDirectory": "/app/backend",
+  "port": 3000,
+  "apiKey": "",
+  "defaultModel": "deepseek-v4-pro",
+  "cleanupIntervalMs": 600000,
+  "cleanupMaxAgeMs": 3600000,
+  "sessionTtlMs": 300000,
+  "maxRetries": 2,
+  "retryBaseDelay": 1000,
+  "requestTimeoutMs": 300000,
+  "debug": false
+}
