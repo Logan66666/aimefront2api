@@ -328,23 +328,35 @@ const stats = {
   successRequests: 0,
   errorRequests: 0,
   streamRequests: 0,
-  modelUsage: {},      // { modelName: count }
-  sessionReuses: 0,
+  modelUsage: {},      // { modelName: { requests, tokensIn, tokensOut, errors } }
   totalTokens: { input: 0, output: 0 },
   responseTimes: [],   // 最近 100 次响应时间
+  timeline: {},        // { "HH:MM": count } 按分钟
 };
 
 function recordRequest(model, stream, success, tokens, durationMs) {
   stats.totalRequests++;
   if (success) stats.successRequests++; else stats.errorRequests++;
   if (stream) stats.streamRequests++;
-  stats.modelUsage[model] = (stats.modelUsage[model] || 0) + 1;
+
+  if (!stats.modelUsage[model]) {
+    stats.modelUsage[model] = { requests: 0, tokensIn: 0, tokensOut: 0, errors: 0 };
+  }
+  stats.modelUsage[model].requests++;
+  if (!success) stats.modelUsage[model].errors++;
   if (tokens) {
+    stats.modelUsage[model].tokensIn += tokens.input || 0;
+    stats.modelUsage[model].tokensOut += tokens.output || 0;
     stats.totalTokens.input += tokens.input || 0;
     stats.totalTokens.output += tokens.output || 0;
   }
   stats.responseTimes.push(durationMs);
   if (stats.responseTimes.length > 100) stats.responseTimes.shift();
+
+  const minKey = new Date().toISOString().slice(0, 16).replace("T", " ");
+  stats.timeline[minKey] = (stats.timeline[minKey] || 0) + 1;
+  const keys = Object.keys(stats.timeline);
+  if (keys.length > 120) { for (const k of keys.slice(0, keys.length - 120)) delete stats.timeline[k]; }
 }
 
 // ============================================================
@@ -568,7 +580,19 @@ app.get("/dashboard", (req, res) => {
   const avgTime = stats.responseTimes.length > 0
     ? Math.round(stats.responseTimes.reduce((a, b) => a + b, 0) / stats.responseTimes.length)
     : 0;
-  const sortModels = Object.entries(stats.modelUsage).sort((a, b) => b[1] - a[1]);
+  const succRate = stats.totalRequests > 0 ? Math.round(stats.successRequests / stats.totalRequests * 100) : 100;
+
+  // 模型表（按请求数排序）
+  const modelRows = Object.entries(stats.modelUsage)
+    .sort((a, b) => b[1].requests - a[1].requests);
+
+  // 时间线数据 → CSS bar chart
+  const timelineEntries = Object.entries(stats.timeline).sort();
+  const timelineMax = Math.max(1, ...timelineEntries.map(e => e[1]));
+  const timelineBars = timelineEntries.slice(-60).map(([time, count]) => {
+    const pct = Math.round(count / timelineMax * 100);
+    return `<div class="tl-bar" title="${time}: ${count} 请求"><div class="tl-fill" style="height:${pct}%"></div><span>${time.slice(11)}</span></div>`;
+  }).join('');
 
   res.send(`<!DOCTYPE html>
 <html lang="zh-CN">
@@ -576,73 +600,116 @@ app.get("/dashboard", (req, res) => {
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AIME Proxy · Dashboard</title>
 <style>
-  :root{--bg:#fafaf9;--card:#fff;--border:#e7e5e4;--text:#292524;--muted:#78716c;--navy:#1e3a8a;--green:#166534;--red:#991b1b;--gr-bg:#dcfce7;--rd-bg:#fee2e2}
+  :root{--bg:#fafaf9;--card:#fff;--border:#e7e5e4;--text:#292524;--muted:#78716c;--navy:#1e3a8a;--green:#166534;--red:#991b1b;--amber:#b45309;--gr-bg:#dcfce7;--rd-bg:#fee2e2;--nb:#dbeafe}
   *{margin:0;padding:0;box-sizing:border-box}
-  body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);line-height:1.6;padding:24px 32px}
-  h1{font-size:22px;font-weight:700;color:var(--navy);margin-bottom:4px}
-  .sub{font-size:13px;color:var(--muted);margin-bottom:24px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px;margin-bottom:28px}
-  .box{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:18px}
-  .box .num{font-size:26px;font-weight:800;color:var(--navy)}
-  .box .lbl{font-size:12px;color:var(--muted);margin-top:2px}
-  .box.g .num{color:var(--green)}.box.r .num{color:var(--red)}
-  table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
-  th,td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--border)}
-  th{font-size:11px;text-transform:uppercase;color:var(--muted);font-weight:700}
-  td.mono{font-family:"SF Mono",monospace;font-size:12px}
-  .bar-wrap{background:#f5f5f4;border-radius:3px;height:8px;overflow:hidden;min-width:60px}
-  .bar-fill{background:var(--navy);height:100%;border-radius:3px}
-  .section{margin-bottom:28px}
-  .section h2{font-size:15px;font-weight:700;margin-bottom:8px;color:var(--text)}
-  .rfr{font-size:12px;color:var(--muted);text-align:center;margin-top:20px}
+  body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);line-height:1.6;padding:28px 36px;max-width:1100px;margin:0 auto}
+  .header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:24px;flex-wrap:wrap;gap:12px}
+  h1{font-size:22px;font-weight:700;color:var(--navy)}
+  .meta{font-size:12px;color:var(--muted);display:flex;gap:16px;flex-wrap:wrap}
+  .meta span{padding:3px 10px;background:var(--nb);border-radius:3px;font-weight:600;color:var(--navy)}
+
+  .kpi-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:12px;margin-bottom:24px}
+  .kpi{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:16px}
+  .kpi .v{font-size:24px;font-weight:800;color:var(--navy)}
+  .kpi .l{font-size:11px;color:var(--muted);margin-top:2px}
+  .kpi.ok .v{color:var(--green)}
+  .kpi.err .v{color:var(--red)}
+  .kpi.warn .v{color:var(--amber)}
+
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:24px}
+  @media(max-width:768px){.row{grid-template-columns:1fr}}
+
+  .panel{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:20px}
+  .panel h3{font-size:14px;font-weight:700;margin-bottom:12px;color:var(--text);border-bottom:1px solid var(--border);padding-bottom:8px}
+
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{padding:7px 10px;text-align:left;border-bottom:1px solid var(--border);white-space:nowrap}
+  th{font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700;background:#fafaf9}
+  td.mono{font-family:"SF Mono","Fira Code",monospace;font-size:12px}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  tr:hover td{background:var(--nb)}
+
+  .bar-wrap{background:#f5f5f4;border-radius:3px;height:6px;overflow:hidden}
+  .bar-fill{background:var(--navy);height:100%;border-radius:3px;transition:width .3s}
+
+  .tl-chart{display:flex;align-items:flex-end;gap:2px;height:100px;padding:4px 0;overflow-x:auto}
+  .tl-bar{flex:0 0 auto;width:14px;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%}
+  .tl-fill{width:100%;background:var(--navy);border-radius:2px 2px 0 0;min-height:2px;transition:height .3s}
+  .tl-bar span{font-size:8px;color:var(--muted);margin-top:2px;transform:rotate(-45deg);white-space:nowrap}
+
+  .footer{text-align:center;font-size:11px;color:var(--muted);margin-top:16px;padding-top:12px;border-top:1px solid var(--border)}
+  .row-full{margin-bottom:24px}
 </style>
 </head>
 <body>
-<h1>AIME Proxy · Dashboard</h1>
-<p class="sub">运行时间: ${formatUptime(uptime)} &nbsp;|&nbsp; 刷新: <span id="timer">0</span>s 前</p>
-
-<div class="grid">
-  <div class="box"><div class="num">${stats.totalRequests}</div><div class="lbl">总请求</div></div>
-  <div class="box g"><div class="num">${stats.successRequests}</div><div class="lbl">成功 (${stats.totalRequests>0?Math.round(stats.successRequests/stats.totalRequests*100):0}%)</div></div>
-  <div class="box r"><div class="num">${stats.errorRequests}</div><div class="lbl">失败</div></div>
-  <div class="box"><div class="num">${stats.streamRequests}</div><div class="lbl">流式请求</div></div>
-  <div class="box"><div class="num">${stats.sessionReuses}</div><div class="lbl">Session 复用</div></div>
-  <div class="box"><div class="num">${avgTime}ms</div><div class="lbl">平均响应时间</div></div>
+<div class="header">
+  <div>
+    <h1>AIME Proxy · 运行监控</h1>
+  </div>
+  <div class="meta">
+    <span>运行 ${formatUptime(uptime)}</span>
+    <span id="timer">0s 前刷新</span>
+  </div>
 </div>
 
-<div class="grid">
-  <div class="box"><div class="num">${formatTokens(stats.totalTokens.input)}</div><div class="lbl">输入 Token</div></div>
-  <div class="box"><div class="num">${formatTokens(stats.totalTokens.output)}</div><div class="lbl">输出 Token</div></div>
-  <div class="box"><div class="num">${cleanupStats.totalCleaned}</div><div class="lbl">已清理孤儿</div></div>
+<div class="kpi-grid">
+  <div class="kpi"><div class="v">${stats.totalRequests}</div><div class="l">总请求数</div></div>
+  <div class="kpi ok"><div class="v">${succRate}%</div><div class="l">成功率 (${stats.successRequests}/${stats.totalRequests})</div></div>
+  <div class="kpi err"><div class="v">${stats.errorRequests}</div><div class="l">失败请求</div></div>
+  <div class="kpi"><div class="v">${stats.streamRequests}</div><div class="l">流式请求</div></div>
+  <div class="kpi"><div class="v">${avgTime}ms</div><div class="l">平均响应</div></div>
+  <div class="kpi warn"><div class="v">${formatTokens(stats.totalTokens.input + stats.totalTokens.output)}</div><div class="l">Token 消耗</div></div>
 </div>
 
-<div class="section">
-  <h2>模型用量</h2>
-  <table>
-    <tr><th>模型</th><th>请求数</th><th>占比</th></tr>
-    ${sortModels.map(([m,c]) => `<tr><td class="mono">${m}</td><td>${c}</td><td><div style="display:flex;align-items:center;gap:8px"><div class="bar-wrap"><div class="bar-fill" style="width:${(c/stats.totalRequests*100).toFixed(0)}%"></div></div>${(c/stats.totalRequests*100).toFixed(1)}%</div></td></tr>`).join('')}
-    ${sortModels.length===0 ? '<tr><td colspan="3" style="color:var(--muted)">暂无数据</td></tr>' : ''}
-  </table>
+<div class="row">
+  <div class="panel">
+    <h3>请求时间线 (最近 60 分钟)</h3>
+    ${timelineEntries.length > 0 ? `<div class="tl-chart">${timelineBars}</div>` : '<p style="font-size:12px;color:var(--muted);padding:20px">暂无请求数据</p>'}
+  </div>
+  <div class="panel">
+    <h3>可用模型</h3>
+    <table>
+      <tr><th>模型 ID</th><th style="text-align:right">请求</th><th style="text-align:right">Token 入</th><th style="text-align:right">Token 出</th><th style="text-align:right">错误</th><th>占比</th></tr>
+      ${modelRows.map(([m,d]) => `<tr>
+        <td class="mono">${m}</td>
+        <td class="num">${d.requests}</td>
+        <td class="num">${formatTokens(d.tokensIn)}</td>
+        <td class="num">${formatTokens(d.tokensOut)}</td>
+        <td class="num" style="color:${d.errors>0?'var(--red)':'var(--muted)'}">${d.errors}</td>
+        <td><div style="display:flex;align-items:center;gap:6px"><div class="bar-wrap" style="width:80px"><div class="bar-fill" style="width:${(d.requests/stats.totalRequests*100).toFixed(0)}%"></div></div>${(d.requests/stats.totalRequests*100).toFixed(0)}%</div></td>
+      </tr>`).join('')}
+      ${modelRows.length===0 ? '<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:16px">暂无请求数据</td></tr>' : ''}
+    </table>
+  </div>
 </div>
 
-<div class="section">
-  <h2>配置摘要</h2>
-  <table>
-    <tr><td style="color:var(--muted)">AIME 后端</td><td class="mono">${CONFIG.aimeBaseUrl}</td></tr>
-    <tr><td style="color:var(--muted)">端口</td><td>${CONFIG.port}</td></tr>
-    <tr><td style="color:var(--muted)">API Key</td><td>${CONFIG.apiKey ? '已启用' : '未启用'}</td></tr>
-    <tr><td style="color:var(--muted)">默认模型</td><td>${CONFIG.defaultModel}</td></tr>
-    <tr><td style="color:var(--muted)">重试次数</td><td>${CONFIG.maxRetries}</td></tr>
-    <tr><td style="color:var(--muted)">Session TTL</td><td>${CONFIG.sessionTtlMs / 1000}s</td></tr>
-    <tr><td style="color:var(--muted)">清理间隔</td><td>${CONFIG.cleanupIntervalMs / 1000}s</td></tr>
-  </table>
+<div class="row">
+  <div class="panel">
+    <h3>Token 消耗</h3>
+    <table>
+      <tr><td style="color:var(--muted)">输入 Token</td><td class="num mono">${formatTokens(stats.totalTokens.input)}</td></tr>
+      <tr><td style="color:var(--muted)">输出 Token</td><td class="num mono">${formatTokens(stats.totalTokens.output)}</td></tr>
+      <tr><td style="color:var(--muted)">合计</td><td class="num mono" style="font-weight:700">${formatTokens(stats.totalTokens.input + stats.totalTokens.output)}</td></tr>
+      <tr><td style="color:var(--muted)">输入/输出比</td><td class="num mono">${stats.totalTokens.output>0?(stats.totalTokens.input/stats.totalTokens.output).toFixed(1)+':1':'—'}</td></tr>
+    </table>
+  </div>
+  <div class="panel">
+    <h3>配置</h3>
+    <table>
+      <tr><td style="color:var(--muted)">AIME 后端</td><td class="mono" style="font-size:11px">${CONFIG.aimeBaseUrl}</td></tr>
+      <tr><td style="color:var(--muted)">API Key</td><td>${CONFIG.apiKey ? '已启用' : '未启用'}</td></tr>
+      <tr><td style="color:var(--muted)">模型</td><td class="mono">${CONFIG.defaultModel}</td></tr>
+      <tr><td style="color:var(--muted)">重试 / 超时</td><td>${CONFIG.maxRetries} 次 / ${Math.round(CONFIG.requestTimeoutMs/1000)}s</td></tr>
+      <tr><td style="color:var(--muted)">孤儿清理</td><td>${cleanupStats.totalCleaned} 个 (每 ${CONFIG.cleanupIntervalMs/1000}s)</td></tr>
+      <tr><td style="color:var(--muted)">端口</td><td>${CONFIG.port}</td></tr>
+    </table>
+  </div>
 </div>
 
-<p class="rfr">AIME Proxy v1.1 · 页面每 10s 自动刷新</p>
+<div class="footer">AIME Proxy v1.1 · 每 10s 自动刷新 · <a href="/health" style="color:var(--navy)">/health</a></div>
 <script>
-  let t=new Date();
-  setInterval(()=>{document.getElementById('timer').textContent=Math.floor((new Date()-t)/1000)},1000);
-  setTimeout(()=>location.reload(),10000);
+let t=new Date();setInterval(()=>{document.getElementById('timer').textContent=Math.floor((new Date()-t)/1000)+'s 前刷新'},1000);
+setTimeout(()=>location.reload(),10000);
 </script>
 </body></html>`);
 });
