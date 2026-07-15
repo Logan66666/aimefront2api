@@ -335,8 +335,11 @@ async function cleanupOrphanedSessions() {
       console.log(`🧹 [Cleanup] 清理了 ${cleaned} 个泄露的 proxy session`);
     }
   } catch (e) {
-    cleanupStats.running = false;
     console.warn("⚠ [Cleanup] 扫描失败:", e.message);
+  } finally {
+    // 无论正常完成、报错还是早退（listRes 非 ok / sessions 为空）都复位，
+    // 否则 cleanupStats.running 会卡在 true，导致所有后续定时清理被永久跳过。
+    cleanupStats.running = false;
   }
 }
 
