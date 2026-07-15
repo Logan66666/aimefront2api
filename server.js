@@ -291,6 +291,18 @@ let cleanupStats = { lastRun: null, totalCleaned: 0, lastCount: 0, running: fals
 async function cleanupOrphanedSessions() {
   if (cleanupStats.running) return;
   cleanupStats.running = true;
+
+  // 清理过期的 dashboard session token
+  const now = Date.now();
+  let dashCleaned = 0;
+  for (const [token, s] of dashboardSessions) {
+    if (now > s.expires) {
+      dashboardSessions.delete(token);
+      dashCleaned++;
+    }
+  }
+  if (dashCleaned > 0) console.log(`🧹 [Cleanup] 清理了 ${dashCleaned} 个过期 dashboard session`);
+
   try {
     const listRes = await fetchWithRetry(`${CONFIG.aimeBaseUrl}/session`, { headers: aimeHeaders() }, 1);
     if (!listRes.ok) return;
@@ -399,8 +411,9 @@ app.use((req, res, next) => {
 // API Key 鉴权（如果配置了）
 app.use((req, res, next) => {
   if (!CONFIG.apiKey) return next();
-  // Dashboard 使用独立的 cookie 认证，不拦
+  // Dashboard + /health 使用独立的 cookie 认证或不鉴权
   if (req.path === "/dashboard" || req.path === "/dashboard/login" || req.path === "/dashboard/logout") return next();
+  if (req.path === "/health") return next();
   const auth = req.headers.authorization || "";
   if (auth === `Bearer ${CONFIG.apiKey}` || auth === CONFIG.apiKey) return next();
   res.status(401).json({ error: { message: "Invalid API key", type: "authentication_error" } });
@@ -430,10 +443,11 @@ function hasDashboardAuth(req) {
   return true;
 }
 
-function setDashboardCookie(res, token) {
+function setDashboardCookie(res, token, req) {
+  const isSecure = req && (req.secure || req.headers["x-forwarded-proto"] === "https");
   res.cookie(COOKIE_NAME, token, {
     httpOnly: true,
-    secure: false, // 本地开发 HTTP，生产通过反代加 HTTPS 时改为 true
+    secure: isSecure,
     sameSite: "lax",
     maxAge: DASHBOARD_SESSION_TTL,
     path: "/",
@@ -686,7 +700,7 @@ app.post("/dashboard/login", express.urlencoded({ extended: true }), (req, res) 
   }
   const token = generateDashboardToken();
   dashboardSessions.set(token, { expires: Date.now() + DASHBOARD_SESSION_TTL });
-  setDashboardCookie(res, token);
+  setDashboardCookie(res, token, req);
   res.redirect("/dashboard");
 });
 
